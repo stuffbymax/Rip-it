@@ -161,6 +161,7 @@ Movie Title (2024).metadata.json
 - Use this software only for media you own and where local laws permit creating backups.
 
 <img width="1082" height="343" alt="image" src="https://github.com/user-attachments/assets/f58640de-9ab6-44ad-a8d2-18b06dd0a918" />
+<img width="930" height="419" alt="image" src="https://github.com/user-attachments/assets/a8166bb1-4362-4969-957c-f2eb1ce39a85" />
 
 <img width="1095" height="236" alt="image" src="https://github.com/user-attachments/assets/d90e3e25-185e-4b13-9ff0-9b2aa436511b" />
 <img width="1083" height="203" alt="image" src="https://github.com/user-attachments/assets/6f0990d1-0dc5-480b-a5c4-3cd127157d49" />
