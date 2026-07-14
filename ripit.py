@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-gamerip-tui.py — Terminal UI for ripping PS1/PS2 games, music CDs, and
+ripit.py — Terminal UI for ripping PS1/PS2 games, music CDs, and
 movie/TV DVDs on Linux, with optional metadata lookup.
 
 Backends used (must be installed depending on what you rip):
@@ -23,8 +23,8 @@ Install:
   Arch          : sudo pacman -S ddrescue cdrdao cdparanoia flac libcdio eject
 
 Run:
-  python3 gamerip-tui.py           # normal TUI
-  python3 gamerip-tui.py --check   # just check dependencies and exit
+  python3ripit.py           # normal TUI
+  python3ripit.py --check   # just check dependencies and exit
 
 This tool only reads discs you insert — use it for backing up media you own.
 Some commercial DVDs use copy protection; this tool only images raw sectors
