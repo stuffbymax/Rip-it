@@ -162,3 +162,5 @@ Movie Title (2024).metadata.json
 
 
 <img width="1095" height="236" alt="image" src="https://github.com/user-attachments/assets/d90e3e25-185e-4b13-9ff0-9b2aa436511b" />
+<img width="1083" height="203" alt="image" src="https://github.com/user-attachments/assets/6f0990d1-0dc5-480b-a5c4-3cd127157d49" />
+
