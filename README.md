@@ -1,7 +1,7 @@
 ![](https://media.tenor.com/njVGQRUXoVAAAAAC/idk.gif)
 
 
-# its made by ai BTW
+# its made by AI
 # GameRip TUI
 
 A terminal-based disc ripping utility for Linux that can back up:
