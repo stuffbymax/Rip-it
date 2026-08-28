@@ -11,6 +11,7 @@ A terminal-based disc ripping utility for Linux that can back up:
 - 🎵 Music CDs
 - 🎬 Movie DVDs
 - 🎬 Movie Blue-rays
+- 📺 TV series DVDs
 - 📺 TV series Blue-rays
 
   ## not supported ripping 
