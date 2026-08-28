@@ -10,7 +10,19 @@ A terminal-based disc ripping utility for Linux that can back up:
 - 🎮 PlayStation 2 games
 - 🎵 Music CDs
 - 🎬 Movie DVDs
-- 📺 TV series DVDs
+- 🎬 Movie Blue-rays
+- 📺 TV series Blue-rays
+
+  ## not supported ripping 
+
+  - sony
+    - ps3
+    - ps4
+    - ps5
+  - xbox
+    - xbox 360
+    - xbox one
+    - xbox series
 
 GameRip provides a simple curses-based interface while using proven Linux command-line tools for the actual ripping process. :contentReference[oaicite:0]{index=0}
 
