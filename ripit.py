@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ripit.py — Terminal UI for ripping PS1/PS2 games, music CDs, and
-movie/TV DVDs on Linux, with optional metadata lookup.
+movie/TV DVDs/Blu-rays on Linux, with optional metadata lookup.
 
 Backends used (must be installed depending on what you rip):
-  - ddrescue   : robust sector-by-sector reads -> .iso  (PS2, movies/TV, retries bad sectors)
+  - ddrescue   : robust sector-by-sector reads -> .iso  (PS2, DVD/Blu-ray movies/TV, retries bad sectors)
   - cdrdao     : raw CD reads preserving audio tracks -> .bin/.cue (PS1 w/ CD audio)
   - cdparanoia : accurate digital audio extraction -> .wav (music CDs)
   - flac       : optional, compresses ripped audio tracks to FLAC
   - cd-info    : (libcdio-utils) optional, auto-detects track count / audio tracks
-  - udevadm    : (usually preinstalled) detects disc labels / media presence
+  - udevadm    : (usually preinstalled) detects disc labels / media presence / media type (CD/DVD/BD)
   - eject      : (usually preinstalled) ejects the tray when done
 
 Metadata lookups (need internet, no extra Python packages — uses urllib):
@@ -27,9 +27,11 @@ Run:
   python3ripit.py --check   # just check dependencies and exit
 
 This tool only reads discs you insert — use it for backing up media you own.
-Some commercial DVDs use copy protection; this tool only images raw sectors
-(it does not decrypt CSS), but circumvention rules vary by region, so check
-your local laws for video discs.
+Some commercial DVDs and Blu-rays use copy protection (CSS, AACS, BD+); this
+tool only images raw sectors and does not decrypt any of these schemes, so
+an encrypted disc's .iso may not be directly playable without separate
+decryption software. Circumvention rules vary by region, so check your
+local laws for video discs.
 """
 
 import curses
@@ -78,12 +80,12 @@ def save_config(cfg):
 # --------------------------------------------------------------------------
 
 TOOL_INFO = {
-    "ddrescue": "ISO reads for PS2 / movie / TV discs (retries bad sectors)",
+    "ddrescue": "ISO reads for PS2 / DVD / Blu-ray discs (retries bad sectors)",
     "cdrdao": "Raw CD reads preserving audio tracks (PS1 discs with music/FMV)",
     "cdparanoia": "Accurate digital audio extraction from music CDs",
     "flac": "Compresses ripped audio tracks to FLAC (optional)",
     "cd-info": "Auto-detects track count / audio tracks (optional)",
-    "udevadm": "Detects disc label and whether media is inserted (optional)",
+    "udevadm": "Detects disc label, media presence, and media type (optional)",
     "eject": "Ejects the tray automatically once ripping finishes (optional)",
     "toc2cue": "Converts cdrdao's .toc file into a standard .cue file (optional)",
 }
@@ -165,7 +167,19 @@ def probe_drive(dev):
     props = udev_properties(dev)
     has_media = props.get("ID_CDROM_MEDIA") == "1"
     label = props.get("ID_FS_LABEL", "") or props.get("ID_FS_LABEL_ENC", "")
-    return {"dev": dev, "has_media": has_media, "label": label}
+
+    # Figure out what kind of disc is inserted, when udev can tell us.
+    # ID_CDROM_MEDIA_BD / _DVD / _CD are set by udev's cdrom_id helper.
+    if props.get("ID_CDROM_MEDIA_BD") == "1":
+        media_type = "BD"
+    elif props.get("ID_CDROM_MEDIA_DVD") == "1":
+        media_type = "DVD"
+    elif props.get("ID_CDROM_MEDIA_CD") == "1":
+        media_type = "CD"
+    else:
+        media_type = "unknown"
+
+    return {"dev": dev, "has_media": has_media, "label": label, "media_type": media_type}
 
 
 def cdinfo_track_summary(dev):
@@ -278,10 +292,20 @@ def tmdb_search(query, api_key, media_type="movie"):
 # Ripping backends (run with curses suspended so native progress shows)
 # --------------------------------------------------------------------------
 
-def rip_iso(dev, out_path):
-    """ddrescue reads the whole data track to a .iso, retrying bad sectors."""
+def rip_iso(dev, out_path, cluster_sectors=None):
+    """ddrescue reads the whole data track to a .iso, retrying bad sectors.
+
+    cluster_sectors optionally sets ddrescue's -c (cluster) size, which
+    controls how many 2048-byte sectors are read per request. Bumping this
+    up helps throughput on large, mostly-healthy Blu-ray discs; leaving it
+    at the ddrescue default is usually fine and is more careful about
+    isolating bad sectors on scratched discs.
+    """
     mapfile = out_path + ".ddrescue.log"
-    cmd = ["ddrescue", "-b", "2048", "-r3", "-v", dev, out_path, mapfile]
+    cmd = ["ddrescue", "-b", "2048"]
+    if cluster_sectors:
+        cmd += ["-c", str(cluster_sectors)]
+    cmd += ["-r3", "-v", dev, out_path, mapfile]
     print(f"\n$ {' '.join(cmd)}\n")
     rc = subprocess.call(cmd)
     return rc, mapfile
@@ -464,7 +488,11 @@ def choose_drive(stdscr):
 
     options = []
     for d, info in zip(drives, infos):
-        status = "disc detected" if info["has_media"] else "empty / unknown"
+        if info["has_media"]:
+            kind = info["media_type"] if info["media_type"] != "unknown" else "disc"
+            status = f"{kind} detected"
+        else:
+            status = "empty / unknown"
         label = f" \"{info['label']}\"" if info["label"] else ""
         options.append(f"{d}{label} — {status}")
     options.append("Enter device path manually")
@@ -490,7 +518,7 @@ def choose_destination(stdscr, default_name):
     return out_dir, name
 
 
-def do_rip(stdscr, dev, fmt, out_dir, name):
+def do_rip(stdscr, dev, fmt, out_dir, name, cluster_sectors=None):
     """fmt is 'iso' (ddrescue) or 'binclue' (cdrdao). Used by games and video."""
     out_base = os.path.join(out_dir, name)
     curses.endwin()
@@ -502,7 +530,7 @@ def do_rip(stdscr, dev, fmt, out_dir, name):
 
     start = time.time()
     if fmt == "iso":
-        rc, mapfile = rip_iso(dev, out_base + ".iso")
+        rc, mapfile = rip_iso(dev, out_base + ".iso", cluster_sectors=cluster_sectors)
         elapsed = time.time() - start
         print(f"\nddrescue exit code: {rc}  (elapsed {elapsed:.0f}s)")
         result_lines = [
@@ -757,15 +785,52 @@ def flow_music(stdscr):
 
 
 # --------------------------------------------------------------------------
-# Flow: Movie / TV DVD
+# Flow: Movie / TV disc (DVD or Blu-ray)
 # --------------------------------------------------------------------------
 
+def choose_disc_format(stdscr, dev):
+    """Ask (or auto-detect via udev) whether the inserted disc is a DVD or
+    Blu-ray. Returns 'DVD' or 'BD', or None if the user cancelled."""
+    info = probe_drive(dev)
+    detected = info.get("media_type", "unknown")
+
+    if detected in ("DVD", "BD"):
+        options = [f"Auto-detected: {detected}", "DVD", "Blu-ray"]
+    else:
+        options = ["DVD", "Blu-ray"]
+
+    choice = select_from_list(stdscr, "Disc format", options)
+    if choice is None:
+        return None
+    if detected in ("DVD", "BD"):
+        if choice == 0:
+            return detected
+        return "DVD" if choice == 1 else "BD"
+    return "DVD" if choice == 0 else "BD"
+
+
 def flow_video(stdscr):
-    if not require_tool(stdscr, "ddrescue", "Movie/TV disc rips"):
+    if not require_tool(stdscr, "ddrescue", "DVD/Blu-ray disc rips"):
         return
     dev = choose_drive(stdscr)
     if not dev:
         return
+
+    disc_format = choose_disc_format(stdscr, dev)
+    if disc_format is None:
+        return
+
+    if disc_format == "BD":
+        info_screen(stdscr, [
+            "Blu-ray note: this tool images raw sectors with ddrescue, the",
+            "same as it does for DVDs — it does NOT decrypt AACS or BD+.",
+            "An encrypted commercial Blu-ray's .iso will likely need",
+            "separate decryption software (e.g. MakeMKV) before it's",
+            "playable; unencrypted/homemade discs will just work.",
+            "",
+            "Blu-ray discs are large (25-100+ GB); make sure the",
+            "destination has enough free space and the rip may take a while.",
+        ])
 
     kind = select_from_list(stdscr, "What kind of disc?", ["Movie", "TV Series"])
     if kind is None:
@@ -812,7 +877,7 @@ def flow_video(stdscr):
     if is_tv:
         season = text_input(stdscr, "Season number for this disc (optional):", "")
 
-    default_name = title or "video"
+    default_name = title or ("bluray" if disc_format == "BD" else "video")
     if title and year:
         default_name = f"{title} ({year})"
     if is_tv and season:
@@ -822,8 +887,14 @@ def flow_video(stdscr):
     if not out_dir:
         return
 
+    # Blu-ray discs are much larger than DVDs; a bigger ddrescue cluster
+    # size speeds up the initial pass on healthy discs. DVDs keep the
+    # ddrescue default (finer-grained, better for isolating bad sectors).
+    cluster_sectors = 64 if disc_format == "BD" else None
+
     summary = [
         f"Drive:    {dev}",
+        f"Format:   {'Blu-ray' if disc_format == 'BD' else 'DVD'}",
         f"Type:     {'TV Series' if is_tv else 'Movie'}",
         f"Title:    {title or '(not looked up)'}",
         f"Output:   {os.path.join(out_dir, name)}.iso",
@@ -837,7 +908,7 @@ def flow_video(stdscr):
     if stdscr.getch() == ord("q"):
         return
 
-    result_lines, rc = do_rip(stdscr, dev, "iso", out_dir, name)
+    result_lines, rc = do_rip(stdscr, dev, "iso", out_dir, name, cluster_sectors=cluster_sectors)
 
     if title:
         try:
@@ -845,6 +916,7 @@ def flow_video(stdscr):
                 "title": title,
                 "year": year,
                 "season": season or None,
+                "disc_format": disc_format,
                 "tmdb_id": meta.get("id") if meta else None,
                 "overview": meta.get("overview") if meta else None,
             }
@@ -892,7 +964,7 @@ def main_tui(stdscr):
         choice = select_from_list(stdscr, "Main Menu", [
             "Rip PS1 / PS2 game disc",
             "Rip Music CD",
-            "Rip Movie / TV DVD",
+            "Rip Movie / TV disc (DVD/Blu-ray)",
             "Settings (TMDb API key)",
             "Check dependencies",
             "Quit",
