@@ -171,7 +171,6 @@ Movie Title (2024).metadata.json
 - PS1 games containing CD audio should be ripped as **BIN/CUE**.
 - PS2 DVDs are normally best stored as **ISO**.
 - DVDs are imaged sector-for-sector only; CSS-encrypted discs are **not decrypted**.
-- Use this software only for media you own and where local laws permit creating backups.
 
 <img width="1082" height="343" alt="image" src="https://github.com/user-attachments/assets/f58640de-9ab6-44ad-a8d2-18b06dd0a918" />
 <img width="930" height="419" alt="image" src="https://github.com/user-attachments/assets/a8166bb1-4362-4969-957c-f2eb1ce39a85" />
