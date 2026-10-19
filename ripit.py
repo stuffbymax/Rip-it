@@ -53,7 +53,7 @@ import urllib.request
 # Config (stores the TMDb API key)
 # --------------------------------------------------------------------------
 
-CONFIG_DIR = os.path.expanduser("~/.config/gamerip-tui")
+CONFIG_DIR = os.path.expanduser("~/.config/ripit")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 
@@ -357,14 +357,71 @@ def rip_audio_tracks(dev, out_dir, n, track_titles, to_flac):
 # curses helpers
 # --------------------------------------------------------------------------
 
+# Theme colors use the standard 8-color curses palette, so they work in
+# ordinary terminal emulators without requiring true-color support.
+THEMES = {
+    "Default":  {"fg": "white", "bg": "black", "accent": "cyan", "selected_fg": "black", "selected_bg": "cyan"},
+    "Midnight": {"fg": "white", "bg": "blue",  "accent": "cyan", "selected_fg": "black", "selected_bg": "cyan"},
+    "Forest":   {"fg": "white", "bg": "black", "accent": "green", "selected_fg": "black", "selected_bg": "green"},
+    "Amber":    {"fg": "yellow", "bg": "black", "accent": "yellow", "selected_fg": "black", "selected_bg": "yellow"},
+    "Light":    {"fg": "black", "bg": "white", "accent": "blue", "selected_fg": "black", "selected_bg": "cyan"},
+    "Plum":     {"fg": "white", "bg": "black", "accent": "magenta", "selected_fg": "white", "selected_bg": "magenta"},
+}
+
+COLOR_NAMES = {
+    "black": curses.COLOR_BLACK, "red": curses.COLOR_RED,
+    "green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW,
+    "blue": curses.COLOR_BLUE, "magenta": curses.COLOR_MAGENTA,
+    "cyan": curses.COLOR_CYAN, "white": curses.COLOR_WHITE,
+}
+
+# Pair IDs shared by all screens.
+PAIR_NORMAL, PAIR_TITLE, PAIR_MUTED, PAIR_SELECTED, PAIR_ACCENT = range(1, 6)
+
+
+def init_theme(stdscr):
+    """Load the configured palette and apply its background to the screen."""
+    cfg = load_config()
+    theme_name = cfg.get("theme", "Default")
+    palette = THEMES.get(theme_name, THEMES["Default"])
+    if not curses.has_colors():
+        stdscr.bkgd(" ", curses.A_NORMAL)
+        return
+    try:
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            default_bg = -1
+        except curses.error:
+            default_bg = COLOR_NAMES[palette["bg"]]
+        bg = default_bg if palette["bg"] == "black" and default_bg == -1 else COLOR_NAMES[palette["bg"]]
+        curses.init_pair(PAIR_NORMAL, COLOR_NAMES[palette["fg"]], bg)
+        curses.init_pair(PAIR_TITLE, COLOR_NAMES[palette["accent"]], bg)
+        curses.init_pair(PAIR_MUTED, COLOR_NAMES[palette["fg"]], bg)
+        curses.init_pair(PAIR_SELECTED, COLOR_NAMES[palette["selected_fg"]], COLOR_NAMES[palette["selected_bg"]])
+        curses.init_pair(PAIR_ACCENT, COLOR_NAMES[palette["accent"]], bg)
+        stdscr.bkgd(" ", curses.color_pair(PAIR_NORMAL))
+    except curses.error:
+        # Some terminals advertise colors but reject color-pair changes.
+        pass
+
+
+def color_attr(pair, fallback=curses.A_NORMAL):
+    try:
+        return curses.color_pair(pair)
+    except curses.error:
+        return fallback
+
+
 def draw_banner(stdscr, subtitle=""):
     stdscr.erase()
+    stdscr.bkgd(" ", color_attr(PAIR_NORMAL))
     h, w = stdscr.getmaxyx()
     title = "DISC RIPPER — Games / Music / Movies / TV"
-    stdscr.addstr(0, max(0, (w - len(title)) // 2), title, curses.A_BOLD)
+    stdscr.addstr(0, max(0, (w - len(title)) // 2), title, color_attr(PAIR_TITLE, curses.A_BOLD) | curses.A_BOLD)
     if subtitle:
-        stdscr.addstr(1, max(0, (w - len(subtitle)) // 2), subtitle, curses.A_DIM)
-    stdscr.addstr(2, 0, "-" * (w - 1))
+        stdscr.addstr(1, max(0, (w - len(subtitle)) // 2), subtitle, color_attr(PAIR_MUTED, curses.A_DIM) | curses.A_DIM)
+    stdscr.addstr(2, 0, "-" * max(0, w - 1), color_attr(PAIR_ACCENT))
 
 
 def select_from_list(stdscr, title, options, descriptions=None):
@@ -376,15 +433,15 @@ def select_from_list(stdscr, title, options, descriptions=None):
         start_y = 4
         for i, opt in enumerate(options):
             marker = "> " if i == idx else "  "
-            attr = curses.A_REVERSE if i == idx else curses.A_NORMAL
+            attr = color_attr(PAIR_SELECTED, curses.A_REVERSE) if i == idx else color_attr(PAIR_NORMAL)
             row = start_y + i * 2
             if row >= h - 3:
                 break
             stdscr.addstr(row, 2, f"{marker}{opt}"[: w - 3], attr)
             if descriptions and i < len(descriptions) and descriptions[i] and row + 1 < h - 3:
                 for j, wrapped in enumerate(textwrap.wrap(descriptions[i], max(w - 8, 10))):
-                    stdscr.addstr(row + 1, 6, wrapped, curses.A_DIM)
-        stdscr.addstr(h - 2, 2, "Up/Down to move, Enter to select, q to cancel", curses.A_DIM)
+                    stdscr.addstr(row + 1, 6, wrapped, color_attr(PAIR_MUTED, curses.A_DIM) | curses.A_DIM)
+        stdscr.addstr(h - 2, 2, "Up/Down to move, Enter to select, q to cancel", color_attr(PAIR_MUTED, curses.A_DIM) | curses.A_DIM)
         stdscr.refresh()
         key = stdscr.getch()
         if key in (curses.KEY_UP, ord("k")):
@@ -940,10 +997,10 @@ def settings_menu(stdscr):
         masked = (current[:4] + "...") if current else "(not set)"
         choice = select_from_list(
             stdscr, "Settings",
-            [f"Set TMDb API key (current: {masked})", "Clear TMDb API key", "Back"],
-            ["Free key from https://www.themoviedb.org/settings/api", "", ""],
+            [f"Set TMDb API key (current: {masked})", "Clear TMDb API key", f"Color theme (current: {cfg.get('theme', 'Default')})", "Back"],
+            ["Free key from https://www.themoviedb.org/settings/api", "", "Choose background and accent colors", ""],
         )
-        if choice is None or choice == 2:
+        if choice is None or choice == 3:
             return
         if choice == 0:
             key = text_input(stdscr, "Enter TMDb API key (v3 auth):", current)
@@ -952,6 +1009,16 @@ def settings_menu(stdscr):
         elif choice == 1:
             cfg["tmdb_api_key"] = ""
             save_config(cfg)
+        elif choice == 2:
+            names = list(THEMES)
+            selected = select_from_list(
+                stdscr, "Color theme", names,
+                ["Classic black background with cyan accents", "Deep blue background", "Green accents on black", "Amber/yellow accents on black", "Light background with blue accents", "Purple accents on black"],
+            )
+            if selected is not None:
+                cfg["theme"] = names[selected]
+                save_config(cfg)
+                init_theme(stdscr)
 
 
 # --------------------------------------------------------------------------
@@ -960,6 +1027,7 @@ def settings_menu(stdscr):
 
 def main_tui(stdscr):
     curses.curs_set(0)
+    init_theme(stdscr)
     while True:
         choice = select_from_list(stdscr, "Main Menu", [
             "Rip PS1 / PS2 game disc",
