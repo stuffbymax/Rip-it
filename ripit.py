@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-ripit.py — Terminal UI for ripping PS1/PS2 games, music CDs, and
-movie/TV DVDs/Blu-rays on Linux, with optional metadata lookup.
+ripit.py Terminal UI for ripping PS1/PS2 games, music CDs, and
+movie/TV DVDs/Blu-rays on Linux, with optional metadata lookup and
+video format conversion (MKV / MP4 / ISO).
 
 Backends used (must be installed depending on what you rip):
-  - ddrescue   : robust sector-by-sector reads -> .iso  (PS2, DVD/Blu-ray movies/TV, retries bad sectors)
+  - ddrescue   : robust sector-by-sector reads -> .iso  (PS2, DVD/Blu-ray images, retries bad sectors)
   - cdrdao     : raw CD reads preserving audio tracks -> .bin/.cue (PS1 w/ CD audio)
   - cdparanoia : accurate digital audio extraction -> .wav (music CDs)
   - flac       : optional, compresses ripped audio tracks to FLAC
+  - makemkvcon : MakeMKV CLI, rips DVD/Blu-ray titles to .mkv (handles encrypted discs)
+  - ffmpeg     : converts to MP4/MKV; also rips the main title of UNPROTECTED discs
   - cd-info    : (libcdio-utils) optional, auto-detects track count / audio tracks
   - udevadm    : (usually preinstalled) detects disc labels / media presence / media type (CD/DVD/BD)
+  - udisksctl  : optional, mounts the disc for the ffmpeg (unprotected) video route
   - eject      : (usually preinstalled) ejects the tray when done
 
 Metadata lookups (need internet, no extra Python packages — uses urllib):
@@ -18,20 +22,23 @@ Metadata lookups (need internet, no extra Python packages — uses urllib):
     set it from the Settings menu in the app.
 
 Install:
-  Debian/Ubuntu : sudo apt install gddrescue cdrdao cdparanoia flac libcdio-utils eject
-  Fedora        : sudo dnf install ddrescue cdrdao cdparanoia flac libcdio-utils eject
-  Arch          : sudo pacman -S ddrescue cdrdao cdparanoia flac libcdio eject
+  Debian/Ubuntu : sudo apt install gddrescue cdrdao cdparanoia flac libcdio-utils eject ffmpeg udisks2
+  Fedora        : sudo dnf install ddrescue cdrdao cdparanoia flac libcdio-utils eject ffmpeg udisks2
+  Arch          : sudo pacman -S ddrescue cdrdao cdparanoia flac libcdio eject ffmpeg udisks2
+  MakeMKV       : not in most distro repos — get it from https://www.makemkv.com
+                  (needs a license key after the trial period)
 
 Run:
-  python3ripit.py           # normal TUI
-  python3ripit.py --check   # just check dependencies and exit
+  python3 ripit.py           # normal TUI
+  python3 ripit.py --check   # just check dependencies and exit
 
 This tool only reads discs you insert — use it for backing up media you own.
-Some commercial DVDs and Blu-rays use copy protection (CSS, AACS, BD+); this
-tool only images raw sectors and does not decrypt any of these schemes, so
-an encrypted disc's .iso may not be directly playable without separate
-decryption software. Circumvention rules vary by region, so check your
-local laws for video discs.
+Video output options:
+  - ISO : raw sector image via ddrescue. Does NOT decrypt anything.
+  - MKV / MP4 via MakeMKV : MakeMKV handles the disc's copy protection itself.
+  - MKV / MP4 via ffmpeg  : unprotected/homemade discs only; ffmpeg cannot read
+    encrypted commercial discs.
+Circumvention rules vary by region, so check your local laws for video discs.
 """
 
 import curses
@@ -84,16 +91,20 @@ TOOL_INFO = {
     "cdrdao": "Raw CD reads preserving audio tracks (PS1 discs with music/FMV)",
     "cdparanoia": "Accurate digital audio extraction from music CDs",
     "flac": "Compresses ripped audio tracks to FLAC (optional)",
+    "makemkvcon": "Rips DVD/Blu-ray titles to MKV (get MakeMKV from makemkv.com)",
+    "ffmpeg": "Converts video to MP4/MKV; rips unprotected discs",
     "cd-info": "Auto-detects track count / audio tracks (optional)",
     "udevadm": "Detects disc label, media presence, and media type (optional)",
+    "udisksctl": "Mounts the disc for the ffmpeg video route (optional)",
     "eject": "Ejects the tray automatically once ripping finishes (optional)",
     "toc2cue": "Converts cdrdao's .toc file into a standard .cue file (optional)",
 }
 
 INSTALL_HINTS = {
-    "apt": "sudo apt install gddrescue cdrdao cdparanoia flac libcdio-utils eject",
-    "dnf": "sudo dnf install ddrescue cdrdao cdparanoia flac libcdio-utils eject",
-    "pacman": "sudo pacman -S ddrescue cdrdao cdparanoia flac libcdio eject",
+    "apt": "sudo apt install gddrescue cdrdao cdparanoia flac libcdio-utils eject ffmpeg udisks2",
+    "dnf": "sudo dnf install ddrescue cdrdao cdparanoia flac libcdio-utils eject ffmpeg udisks2",
+    "pacman": "sudo pacman -S ddrescue cdrdao cdparanoia flac libcdio eject ffmpeg udisks2",
+    "makemkv": "download from https://www.makemkv.com (not in most repos)",
 }
 
 
@@ -106,11 +117,12 @@ def check_dependencies(print_report=False):
     if print_report:
         print("Tools:")
         for t, desc in TOOL_INFO.items():
-            print(f"  [{'OK' if status[t] else 'MISSING'}] {t:10s} - {desc}")
+            print(f"  [{'OK' if status[t] else 'MISSING'}] {t:11s} - {desc}")
         if not all(status.values()):
             print("\nInstall missing tools with one of:")
             for mgr, cmd in INSTALL_HINTS.items():
                 print(f"  {mgr:8s}: {cmd}")
+            print("\nYou only need the tools for the kinds of discs you rip.")
         else:
             print("\nAll tools are present.")
     return status
@@ -168,7 +180,6 @@ def probe_drive(dev):
     has_media = props.get("ID_CDROM_MEDIA") == "1"
     label = props.get("ID_FS_LABEL", "") or props.get("ID_FS_LABEL_ENC", "")
 
-    # Figure out what kind of disc is inserted, when udev can tell us.
     # ID_CDROM_MEDIA_BD / _DVD / _CD are set by udev's cdrom_id helper.
     if props.get("ID_CDROM_MEDIA_BD") == "1":
         media_type = "BD"
@@ -234,7 +245,7 @@ def cdparanoia_track_count(dev):
 # Metadata lookups
 # --------------------------------------------------------------------------
 
-USER_AGENT = "gamerip-tui/1.1 ( personal-use disc backup tool )"
+USER_AGENT = "ripit-tui/1.2 ( personal-use disc backup tool )"
 
 
 def _http_get_json(url, headers=None, timeout=15):
@@ -353,6 +364,190 @@ def rip_audio_tracks(dev, out_dir, n, track_titles, to_flac):
     return results
 
 
+# ---- Video backends: MakeMKV, ffmpeg ---------------------------------------
+
+VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".avi", ".mov", ".wmv", ".ts", ".m2ts",
+              ".mts", ".vob", ".mpg", ".mpeg", ".webm", ".flv", ".ogv")
+
+
+def rip_mkv(dev, work_dir, min_seconds):
+    """makemkvcon remuxes every title longer than min_seconds to .mkv.
+    MakeMKV handles the disc's copy protection itself."""
+    os.makedirs(work_dir, exist_ok=True)
+    cmd = ["makemkvcon", "mkv", f"dev:{dev}", "all", work_dir,
+           f"--minlength={min_seconds}", "--progress=-same"]
+    print(f"\n$ {' '.join(cmd)}\n")
+    return subprocess.call(cmd)
+
+
+def build_ffmpeg_cmd(src, dst, out_fmt, crf=18, preset="medium"):
+    """MKV: lossless stream copy (video, all audio, all subtitles).
+    MP4: H.264 + AAC transcode; first video stream + all audio, no subtitles
+    (MP4 can't hold most disc subtitle formats)."""
+    cmd = ["ffmpeg", "-y", "-i", src, "-map", "0:v:0", "-map", "0:a?"]
+    if out_fmt == "mkv":
+        cmd += ["-map", "0:s?", "-c", "copy"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k",
+                "-movflags", "+faststart"]
+    cmd += ["-max_muxing_queue_size", "1024", dst]
+    return cmd
+
+
+def convert_to_mp4(src, dst, crf=18):
+    cmd = build_ffmpeg_cmd(src, dst, "mp4", crf=crf)
+    print(f"\n$ {' '.join(cmd)}\n")
+    return subprocess.call(cmd)
+
+
+def find_mountpoint(dev):
+    real = os.path.realpath(dev)
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and os.path.realpath(parts[0]) == real:
+                    return parts[1].replace("\\040", " ")
+    except OSError:
+        pass
+    return None
+
+
+def ensure_mounted(dev):
+    """Return the disc's mount point, mounting via udisksctl if needed."""
+    mp = find_mountpoint(dev)
+    if mp:
+        return mp
+    if which("udisksctl"):
+        subprocess.run(["udisksctl", "mount", "-b", dev], capture_output=True, text=True)
+        return find_mountpoint(dev)
+    return None
+
+
+def _find_child_ci(parent, name):
+    """Case-insensitive lookup of a child entry (discs vary in case)."""
+    try:
+        for entry in os.listdir(parent):
+            if entry.lower() == name.lower():
+                return os.path.join(parent, entry)
+    except OSError:
+        pass
+    return None
+
+
+def find_main_video_source(mountpoint):
+    """Locate the main title of a mounted, UNPROTECTED disc.
+    Returns (description, ffmpeg_input) or (None, None).
+
+    DVD: the VIDEO_TS title set with the most data, parts joined with the
+         ffmpeg concat protocol.
+    BD : the largest .m2ts in BDMV/STREAM (a decent guess at the main
+         feature; discs with seamless-branching playlists may differ).
+    """
+    video_ts = _find_child_ci(mountpoint, "VIDEO_TS")
+    if video_ts:
+        sets = {}
+        for f in os.listdir(video_ts):
+            m = re.match(r"VTS_(\d\d)_(\d+)\.VOB$", f, re.IGNORECASE)
+            if m and int(m.group(2)) >= 1:   # part 0 is the menu
+                sets.setdefault(m.group(1), []).append(os.path.join(video_ts, f))
+        if sets:
+            best = max(sets.values(), key=lambda fl: sum(os.path.getsize(p) for p in fl))
+            best.sort()
+            return f"DVD title set ({len(best)} VOB file(s))", "concat:" + "|".join(best)
+
+    bdmv = _find_child_ci(mountpoint, "BDMV")
+    if bdmv:
+        stream = _find_child_ci(bdmv, "STREAM")
+        if stream:
+            files = [os.path.join(stream, f) for f in os.listdir(stream) if f.lower().endswith(".m2ts")]
+            if files:
+                biggest = max(files, key=os.path.getsize)
+                return f"Blu-ray stream {os.path.basename(biggest)}", biggest
+
+    return None, None
+
+
+def do_rip_video(stdscr, dev, out_fmt, engine, out_dir, name, is_tv,
+                 min_seconds, crf, cluster_sectors=None):
+    """Handles iso / mkv / mp4 for movie and TV discs.
+    engine is 'makemkv' (handles encrypted discs, all titles) or
+    'ffmpeg' (unprotected discs only, main title only)."""
+    if out_fmt == "iso":
+        return do_rip(stdscr, dev, "iso", out_dir, name, cluster_sectors=cluster_sectors)
+
+    curses.endwin()
+    print("=" * 70)
+    print(f"Ripping {dev} -> {out_fmt.upper()} via {engine}")
+    print("Do not remove the disc until this finishes.")
+    print("=" * 70)
+
+    start = time.time()
+    lines = []
+    rc = 1
+
+    if engine == "makemkv":
+        work_dir = os.path.join(out_dir, name)
+        rc = rip_mkv(dev, work_dir, min_seconds)
+        mkvs = sorted(glob.glob(os.path.join(work_dir, "*.mkv")))
+        lines = [f"makemkvcon exit code: {rc}", f"{len(mkvs)} title(s) ripped"]
+
+        # A movie disc that yields exactly one title -> flatten to "Name.mkv"
+        if not is_tv and len(mkvs) == 1:
+            flat = os.path.join(out_dir, name + ".mkv")
+            os.replace(mkvs[0], flat)
+            try:
+                os.rmdir(work_dir)
+            except OSError:
+                pass
+            mkvs = [flat]
+
+        if out_fmt == "mp4" and mkvs and rc == 0:
+            for src in mkvs:
+                dst = os.path.splitext(src)[0] + ".mp4"
+                crc = convert_to_mp4(src, dst, crf=crf)
+                if crc == 0 and os.path.exists(dst):
+                    os.remove(src)          # keep only the MP4
+                    lines.append(f"MP4: {dst}")
+                else:
+                    lines.append(f"ffmpeg failed on {src} (MKV kept)")
+        else:
+            lines += [f"MKV: {p}" for p in mkvs]
+    else:
+        print("Looking for the disc's mount point...")
+        mp = ensure_mounted(dev)
+        if not mp:
+            lines = [f"Could not find or mount {dev}.",
+                     "Mount the disc manually (or install udisks2) and try again."]
+        else:
+            desc, src = find_main_video_source(mp)
+            if not src:
+                lines = [f"No VIDEO_TS or BDMV folder found on {mp}.",
+                         "The disc may be unreadable or not a video disc."]
+            else:
+                print(f"Using {desc} from {mp}")
+                os.makedirs(out_dir, exist_ok=True)
+                dst = os.path.join(out_dir, f"{name}.{out_fmt}")
+                cmd = build_ffmpeg_cmd(src, dst, out_fmt, crf=crf)
+                print(f"\n$ {' '.join(cmd)}\n")
+                rc = subprocess.call(cmd)
+                if rc == 0 and os.path.exists(dst):
+                    lines = [f"ffmpeg finished ({desc}).", f"{out_fmt.upper()}: {dst}"]
+                else:
+                    if os.path.exists(dst):
+                        os.remove(dst)
+                    lines = [f"ffmpeg exit code: {rc}",
+                             "If the disc is a commercial/encrypted one, ffmpeg can't read it —",
+                             "use the MakeMKV engine instead."]
+
+    print(f"\nDone in {time.time() - start:.0f}s.")
+    print("\nPress Enter to return to the menu...")
+    input()
+    stdscr.refresh()
+    return lines, rc
+
+
 # --------------------------------------------------------------------------
 # curses helpers
 # --------------------------------------------------------------------------
@@ -441,6 +636,7 @@ def select_from_list(stdscr, title, options, descriptions=None):
             if descriptions and i < len(descriptions) and descriptions[i] and row + 1 < h - 3:
                 for j, wrapped in enumerate(textwrap.wrap(descriptions[i], max(w - 8, 10))):
                     stdscr.addstr(row + 1, 6, wrapped, color_attr(PAIR_MUTED, curses.A_DIM) | curses.A_DIM)
+                    break
         stdscr.addstr(h - 2, 2, "Up/Down to move, Enter to select, q to cancel", color_attr(PAIR_MUTED, curses.A_DIM) | curses.A_DIM)
         stdscr.refresh()
         key = stdscr.getch()
@@ -458,8 +654,8 @@ def text_input(stdscr, prompt, default=""):
     curses.curs_set(1)
     draw_banner(stdscr, "")
     h, w = stdscr.getmaxyx()
-    stdscr.addstr(4, 2, prompt)
-    stdscr.addstr(6, 2, f"(default: {default})" if default else "", curses.A_DIM)
+    stdscr.addstr(4, 2, prompt[: w - 3])
+    stdscr.addstr(6, 2, f"(default: {default})"[: w - 3] if default else "", curses.A_DIM)
     stdscr.addstr(8, 2, "> ")
     stdscr.refresh()
     curses.echo()
@@ -562,8 +758,8 @@ def choose_drive(stdscr):
     return drives[choice]
 
 
-def choose_destination(stdscr, default_name):
-    out_dir = text_input(stdscr, "Save to directory:", os.path.expanduser("~/Games"))
+def choose_destination(stdscr, default_name, default_dir="~/Games"):
+    out_dir = text_input(stdscr, "Save to directory:", os.path.expanduser(default_dir))
     out_dir = os.path.expanduser(out_dir)
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -760,7 +956,9 @@ def flow_music(stdscr):
     chosen_release = None
 
     if query:
-        releases, err = run_with_spinner(stdscr, "Searching MusicBrainz...", musicbrainz_search_release, query)
+        releases, err = run_with_spinner(
+            stdscr, "Searching MusicBrainz...", musicbrainz_search_release, query
+        ) or ([], "Search failed")
         if err:
             info_screen(stdscr, [f"MusicBrainz search failed: {err}", "Continuing without metadata."])
         elif not releases:
@@ -780,7 +978,7 @@ def flow_music(stdscr):
                 chosen_release = releases[idx]
                 titles, err2 = run_with_spinner(
                     stdscr, "Fetching track list...", musicbrainz_release_tracks, chosen_release["id"]
-                )
+                ) or (None, "Lookup failed")
                 if err2:
                     info_screen(stdscr, [f"Could not fetch track list: {err2}", "Continuing without titles."])
                 elif titles and len(titles) == n:
@@ -798,7 +996,7 @@ def flow_music(stdscr):
         fmt_choice = select_from_list(stdscr, "Audio format", ["WAV (uncompressed)", "FLAC (compressed, lossless)"])
         to_flac = fmt_choice == 1
 
-    out_dir, name = choose_destination(stdscr, album_dir_name)
+    out_dir, name = choose_destination(stdscr, album_dir_name, default_dir="~/Music")
     if not out_dir:
         return
     album_path = os.path.join(out_dir, name)
@@ -866,9 +1064,20 @@ def choose_disc_format(stdscr, dev):
     return "DVD" if choice == 0 else "BD"
 
 
+def choose_mp4_quality(stdscr):
+    """Returns an x264 CRF value (lower = better quality / bigger file), or None."""
+    choice = select_from_list(
+        stdscr, "MP4 quality",
+        ["High (CRF 18) — near-transparent, large files",
+         "Balanced (CRF 21) — good quality, moderate size",
+         "Small (CRF 24) — noticeably smaller, some quality loss"],
+    )
+    if choice is None:
+        return None
+    return [18, 21, 24][choice]
+
+
 def flow_video(stdscr):
-    if not require_tool(stdscr, "ddrescue", "DVD/Blu-ray disc rips"):
-        return
     dev = choose_drive(stdscr)
     if not dev:
         return
@@ -877,7 +1086,49 @@ def flow_video(stdscr):
     if disc_format is None:
         return
 
-    if disc_format == "BD":
+    # ---- Output format -------------------------------------------------
+    fmt_choice = select_from_list(
+        stdscr, "Output format",
+        ["MKV (lossless remux, recommended)",
+         "MP4 (H.264/AAC transcode, widest device support)",
+         "ISO (raw disc image)"],
+        ["Keeps all audio/subtitle tracks",
+         "Slow; drops subtitles; plays on almost anything",
+         "Sector copy via ddrescue; no decryption"],
+    )
+    if fmt_choice is None:
+        return
+    out_fmt = ["mkv", "mp4", "iso"][fmt_choice]
+
+    # ---- Engine (MKV/MP4 only) ----------------------------------------
+    engine = None
+    if out_fmt != "iso":
+        eng_choice = select_from_list(
+            stdscr, "Ripping engine",
+            ["MakeMKV (handles encrypted discs, rips all titles)",
+             "ffmpeg (unprotected discs only, main title only)"],
+            ["Needs makemkvcon installed", "Needs ffmpeg; disc must be readable/mounted"],
+        )
+        if eng_choice is None:
+            return
+        engine = "makemkv" if eng_choice == 0 else "ffmpeg"
+
+    # ---- Tool checks ---------------------------------------------------
+    needs = []
+    if out_fmt == "iso":
+        needs = [("ddrescue", "ISO rips")]
+    elif engine == "makemkv":
+        needs = [("makemkvcon", "MKV rips")]
+        if out_fmt == "mp4":
+            needs.append(("ffmpeg", "MP4 conversion"))
+    else:
+        needs = [("ffmpeg", "ffmpeg disc rips")]
+    for tool, why in needs:
+        if not require_tool(stdscr, tool, why):
+            return
+
+    # ---- Notes ---------------------------------------------------------
+    if out_fmt == "iso" and disc_format == "BD":
         info_screen(stdscr, [
             "Blu-ray note: this tool images raw sectors with ddrescue, the",
             "same as it does for DVDs — it does NOT decrypt AACS or BD+.",
@@ -888,12 +1139,21 @@ def flow_video(stdscr):
             "Blu-ray discs are large (25-100+ GB); make sure the",
             "destination has enough free space and the rip may take a while.",
         ])
+    elif engine == "ffmpeg":
+        info_screen(stdscr, [
+            "ffmpeg route: works only on unprotected / homemade discs.",
+            "It rips ONE title — the largest on the disc (usually the main",
+            "feature). Encrypted commercial discs will fail; use MakeMKV",
+            "for those. TV discs with several episodes should use MakeMKV",
+            "so every episode is ripped.",
+        ])
 
     kind = select_from_list(stdscr, "What kind of disc?", ["Movie", "TV Series"])
     if kind is None:
         return
     is_tv = kind == 1
 
+    # ---- TMDb lookup ---------------------------------------------------
     cfg = load_config()
     api_key = cfg.get("tmdb_api_key", "")
     title = None
@@ -911,7 +1171,7 @@ def flow_video(stdscr):
         if query:
             results, err = run_with_spinner(
                 stdscr, "Searching TMDb...", tmdb_search, query, api_key, "tv" if is_tv else "movie"
-            )
+            ) or ([], "Search failed")
             if err:
                 info_screen(stdscr, [f"TMDb search failed: {err}", "Continuing without metadata."])
             elif not results:
@@ -940,32 +1200,60 @@ def flow_video(stdscr):
     if is_tv and season:
         default_name += f" - Season {season.zfill(2)}"
 
-    out_dir, name = choose_destination(stdscr, sanitize_filename(default_name))
+    out_dir, name = choose_destination(
+        stdscr, sanitize_filename(default_name),
+        default_dir="~/Videos",
+    )
     if not out_dir:
         return
 
-    # Blu-ray discs are much larger than DVDs; a bigger ddrescue cluster
+    # ---- Extra options -------------------------------------------------
+    min_seconds = 600
+    if engine == "makemkv":
+        mins = text_input(stdscr, "Ignore titles shorter than (minutes):", "10" if is_tv else "20")
+        min_seconds = int(mins) * 60 if mins.isdigit() else 600
+
+    crf = 18
+    if out_fmt == "mp4":
+        crf = choose_mp4_quality(stdscr)
+        if crf is None:
+            return
+
+    # Blu-ray ISOs are much larger than DVDs; a bigger ddrescue cluster
     # size speeds up the initial pass on healthy discs. DVDs keep the
     # ddrescue default (finer-grained, better for isolating bad sectors).
     cluster_sectors = 64 if disc_format == "BD" else None
 
+    base = os.path.join(out_dir, name)
+    if out_fmt == "iso":
+        output_desc = f"{base}.iso"
+    elif engine == "makemkv" and is_tv:
+        output_desc = f"{base}/  (folder of episodes, .{out_fmt})"
+    else:
+        output_desc = f"{base}.{out_fmt}"
+
+    engine_desc = {None: "ddrescue", "makemkv": "MakeMKV", "ffmpeg": "ffmpeg"}[engine]
     summary = [
         f"Drive:    {dev}",
-        f"Format:   {'Blu-ray' if disc_format == 'BD' else 'DVD'}",
+        f"Disc:     {'Blu-ray' if disc_format == 'BD' else 'DVD'}",
         f"Type:     {'TV Series' if is_tv else 'Movie'}",
         f"Title:    {title or '(not looked up)'}",
-        f"Output:   {os.path.join(out_dir, name)}.iso",
+        f"Format:   {out_fmt.upper()} via {engine_desc}" + (f" (CRF {crf})" if out_fmt == "mp4" else ""),
+        f"Output:   {output_desc}",
         "",
         "Press any key to start ripping, or q to cancel.",
     ]
     draw_banner(stdscr, "Confirm")
     for i, line in enumerate(summary):
-        stdscr.addstr(4 + i, 2, line)
+        stdscr.addstr(4 + i, 2, line[: curses.COLS - 3] if hasattr(curses, "COLS") else line)
     stdscr.refresh()
     if stdscr.getch() == ord("q"):
         return
 
-    result_lines, rc = do_rip(stdscr, dev, "iso", out_dir, name, cluster_sectors=cluster_sectors)
+    result_lines, rc = do_rip_video(
+        stdscr, dev, out_fmt, engine, out_dir, name, is_tv,
+        min_seconds, crf, cluster_sectors=cluster_sectors,
+    )
 
     if title:
         try:
@@ -974,6 +1262,7 @@ def flow_video(stdscr):
                 "year": year,
                 "season": season or None,
                 "disc_format": disc_format,
+                "output_format": out_fmt,
                 "tmdb_id": meta.get("id") if meta else None,
                 "overview": meta.get("overview") if meta else None,
             }
@@ -984,6 +1273,136 @@ def flow_video(stdscr):
 
     info_screen(stdscr, result_lines)
     maybe_eject(stdscr, dev)
+
+
+# --------------------------------------------------------------------------
+# Flow: Convert an existing video file (or folder of them) to MKV / MP4
+# --------------------------------------------------------------------------
+
+def collect_video_files(path):
+    """A file -> [file]; a folder -> every video file directly inside it."""
+    path = os.path.expanduser(path)
+    if os.path.isfile(path):
+        return [path]
+    if os.path.isdir(path):
+        files = [os.path.join(path, f) for f in sorted(os.listdir(path))
+                 if f.lower().endswith(VIDEO_EXTS)]
+        return [f for f in files if os.path.isfile(f)]
+    return []
+
+
+def flow_convert(stdscr):
+    if not require_tool(stdscr, "ffmpeg", "video conversion"):
+        return
+
+    path = text_input(stdscr, "Path to a video file or a folder of videos:")
+    if not path:
+        return
+    files = collect_video_files(path)
+    if not files:
+        info_screen(stdscr, [f"No video files found at: {path}"])
+        return
+
+    target_choice = select_from_list(
+        stdscr, "Convert to",
+        ["MKV (lossless remux — fast, no quality loss)",
+         "MP4 (H.264/AAC transcode — slow, plays everywhere)"],
+        ["Copies streams as-is into a Matroska container; keeps subtitles",
+         "Re-encodes video and audio; drops subtitles"],
+    )
+    if target_choice is None:
+        return
+    target = "mkv" if target_choice == 0 else "mp4"
+
+    crf = 18
+    if target == "mp4":
+        crf = choose_mp4_quality(stdscr)
+        if crf is None:
+            return
+
+    out_dir_in = text_input(stdscr, "Output directory (blank = same folder as each source):")
+    out_dir = os.path.expanduser(out_dir_in) if out_dir_in else None
+    if out_dir:
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            info_screen(stdscr, [f"Could not create directory: {e}"])
+            return
+
+    keep = select_from_list(stdscr, "Original files", ["Keep originals", "Delete originals after a successful conversion"])
+    if keep is None:
+        return
+    delete_originals = keep == 1
+
+    # Work out the job list, skipping anything that would overwrite its own source.
+    jobs = []
+    skipped = []
+    for src in files:
+        dst_dir = out_dir or os.path.dirname(os.path.abspath(src))
+        dst = os.path.join(dst_dir, os.path.splitext(os.path.basename(src))[0] + "." + target)
+        if os.path.abspath(dst) == os.path.abspath(src):
+            skipped.append(os.path.basename(src))
+        else:
+            jobs.append((src, dst))
+
+    if not jobs:
+        info_screen(stdscr, ["Nothing to do — every file is already ." + target + " in that location."])
+        return
+
+    summary = [
+        f"Files:    {len(jobs)} to convert" + (f" ({len(skipped)} skipped, already .{target})" if skipped else ""),
+        f"Target:   {target.upper()}" + (f" (CRF {crf})" if target == "mp4" else ""),
+        f"Output:   {out_dir or '(next to each source)'}",
+        f"Originals: {'DELETED after success' if delete_originals else 'kept'}",
+        "",
+        "Press any key to start, or q to cancel.",
+    ]
+    draw_banner(stdscr, "Confirm")
+    for i, line in enumerate(summary):
+        stdscr.addstr(4 + i, 2, line)
+    stdscr.refresh()
+    if stdscr.getch() == ord("q"):
+        return
+
+    curses.endwin()
+    print("=" * 70)
+    print(f"Converting {len(jobs)} file(s) to {target.upper()}")
+    print("=" * 70)
+
+    start = time.time()
+    ok, failed = [], []
+    for n, (src, dst) in enumerate(jobs, 1):
+        print(f"\n=== [{n}/{len(jobs)}] {os.path.basename(src)} ===")
+        if os.path.exists(dst):
+            print(f"Skipping: {dst} already exists")
+            failed.append(f"{os.path.basename(src)} (output already exists)")
+            continue
+        cmd = build_ffmpeg_cmd(src, dst, target, crf=crf)
+        print(f"$ {' '.join(cmd)}\n")
+        rc = subprocess.call(cmd)
+        if rc == 0 and os.path.exists(dst):
+            ok.append(dst)
+            if delete_originals:
+                try:
+                    os.remove(src)
+                except OSError:
+                    pass
+        else:
+            failed.append(os.path.basename(src))
+            if os.path.exists(dst):
+                os.remove(dst)   # don't leave half-written files behind
+
+    print(f"\nDone in {time.time() - start:.0f}s. {len(ok)} converted, {len(failed)} failed.")
+    print("\nPress Enter to return to the menu...")
+    input()
+    stdscr.refresh()
+
+    lines = [f"Converted {len(ok)}/{len(jobs)} file(s) to {target.upper()}."]
+    if failed:
+        lines.append("Failed: " + ", ".join(failed))
+        if target == "mkv":
+            lines.append("Tip: some stream types can't be copied into MKV — try MP4 for those.")
+    info_screen(stdscr, lines)
 
 
 # --------------------------------------------------------------------------
@@ -1032,12 +1451,13 @@ def main_tui(stdscr):
         choice = select_from_list(stdscr, "Main Menu", [
             "Rip PS1 / PS2 game disc",
             "Rip Music CD",
-            "Rip Movie / TV disc (DVD/Blu-ray)",
-            "Settings (TMDb API key)",
+            "Rip Movie / TV disc (DVD/Blu-ray -> MKV / MP4 / ISO)",
+            "Convert existing video file(s) to MKV / MP4",
+            "Settings (TMDb API key, theme)",
             "Check dependencies",
             "Quit",
         ])
-        if choice is None or choice == 5:
+        if choice is None or choice == 6:
             return
         if choice == 0:
             flow_game(stdscr)
@@ -1046,11 +1466,14 @@ def main_tui(stdscr):
         elif choice == 2:
             flow_video(stdscr)
         elif choice == 3:
-            settings_menu(stdscr)
+            flow_convert(stdscr)
         elif choice == 4:
+            settings_menu(stdscr)
+        elif choice == 5:
             status = check_dependencies()
-            lines = [f"{'OK ' if ok else 'MISSING'}  {t:10s} - {desc}" for (t, desc), ok in
+            lines = [f"{'OK ' if ok else 'MISSING'}  {t:11s} - {desc}" for (t, desc), ok in
                      zip(TOOL_INFO.items(), status.values())]
+            lines += ["", "You only need the tools for the kinds of discs you rip."]
             info_screen(stdscr, lines)
 
 
