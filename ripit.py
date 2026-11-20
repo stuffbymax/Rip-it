@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ripit.py Terminal UI for ripping PS1/PS2 games, music CDs, and
+ripit.py — Terminal UI for ripping PS1/PS2 games, music CDs, and
 movie/TV DVDs/Blu-rays on Linux, with optional metadata lookup and
 video format conversion (MKV / MP4 / ISO).
 
@@ -47,6 +47,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import textwrap
@@ -374,6 +375,9 @@ def rip_mkv(dev, work_dir, min_seconds):
     """makemkvcon remuxes every title longer than min_seconds to .mkv.
     MakeMKV handles the disc's copy protection itself."""
     os.makedirs(work_dir, exist_ok=True)
+    if not glob.glob("/dev/sg*"):
+        print("WARNING: no /dev/sg* devices found. MakeMKV needs the sg module:")
+        print("         sudo modprobe sg\n")
     cmd = ["makemkvcon", "mkv", f"dev:{dev}", "all", work_dir,
            f"--minlength={min_seconds}", "--progress=-same"]
     print(f"\n$ {' '.join(cmd)}\n")
@@ -492,6 +496,8 @@ def do_rip_video(stdscr, dev, out_fmt, engine, out_dir, name, is_tv,
         rc = rip_mkv(dev, work_dir, min_seconds)
         mkvs = sorted(glob.glob(os.path.join(work_dir, "*.mkv")))
         lines = [f"makemkvcon exit code: {rc}", f"{len(mkvs)} title(s) ripped"]
+        if rc != 0 or not mkvs:
+            lines += drive_failure_hints(dev)
 
         # A movie disc that yields exactly one title -> flatten to "Name.mkv"
         if not is_tv and len(mkvs) == 1:
@@ -725,7 +731,7 @@ def sanitize_filename(s):
 # Shared steps
 # --------------------------------------------------------------------------
 
-def choose_drive(stdscr):
+def _choose_drive_raw(stdscr):
     drives = list_optical_drives()
     if not drives:
         val = text_input(
@@ -756,6 +762,69 @@ def choose_drive(stdscr):
     if choice == len(options) - 1:
         return text_input(stdscr, "Enter device path (e.g. /dev/sr0):") or None
     return drives[choice]
+
+
+def validate_device(dev):
+    """Normalise and sanity-check a device path.
+    Returns (device, problem_lines). problem_lines is empty when OK."""
+    dev = (dev or "").strip()
+    if not dev:
+        return None, ["No device given."]
+    # Forgive common typos: 'sr0', '/dev/src0', '/dev/sr 0'
+    dev = dev.replace(" ", "")
+    if not dev.startswith("/"):
+        dev = "/dev/" + dev
+    dev = re.sub(r"^/dev/src(\d+)$", r"/dev/sr\1", dev)
+
+    if not os.path.exists(dev):
+        found = list_optical_drives()
+        lines = [f"Unknown device: {dev}",
+                 "Optical drives are named /dev/sr0, /dev/sr1, ... (sr, not src)."]
+        lines.append("Detected drives: " + (", ".join(found) if found else "none"))
+        if not found:
+            lines += ["", "No drive visible to Linux. Check the cable / USB connection,",
+                      "and run 'lsblk' or 'dmesg | tail' to see if it was detected."]
+        return None, lines
+    try:
+        if not stat.S_ISBLK(os.stat(dev).st_mode):
+            return None, [f"{dev} is not a block device."]
+    except OSError as e:
+        return None, [f"Cannot stat {dev}: {e}"]
+    if not os.access(dev, os.R_OK):
+        return None, [f"No read permission on {dev}.",
+                      "Add yourself to the cdrom group, then log out and back in:",
+                      "  sudo usermod -aG cdrom $USER",
+                      "(or test by running this script with sudo)."]
+    return dev, []
+
+
+def choose_drive(stdscr):
+    dev = _choose_drive_raw(stdscr)
+    if not dev:
+        return None
+    dev, problems = validate_device(dev)
+    if problems:
+        info_screen(stdscr, problems)
+        return None
+    return dev
+
+
+def drive_failure_hints(dev):
+    """Explain the usual causes of MakeMKV's 'Failed to open disk'."""
+    return [
+        "",
+        "'Failed to open disk' usually means one of:",
+        "1. The sg kernel module isn't loaded (MakeMKV needs it):",
+        "     sudo modprobe sg",
+        "   Make it permanent: echo sg | sudo tee /etc/modules-load.d/sg.conf",
+        "2. No permission on the drive: sudo usermod -aG cdrom $USER",
+        "   (then log out/in). Quick test: run this script with sudo.",
+        f"3. Another program has the disc open (file manager auto-mount, VLC):",
+        f"     sudo umount {dev}   and close that program.",
+        "4. MakeMKV is out of date or its key/beta key expired — update from",
+        "   makemkv.com (new discs often need the latest version).",
+        "5. The disc is dirty/scratched or the drive can't read this format.",
+    ]
 
 
 def choose_destination(stdscr, default_name, default_dir="~/Games"):
